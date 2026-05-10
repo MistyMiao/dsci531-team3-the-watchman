@@ -1,0 +1,98 @@
+# Instructions
+You will be given a user comment in its original language.
+Your job is to annotate it based on the Toxicity Criteria below.
+
+# Shared Rules
+Important:
+- Judge the comment based only on the text itself and immediately inferable context.
+- Do not infer hidden intent or unwritten content that is not reasonably supported by the text.
+- The comment may be in a language other than English. In that case, judge it with respect to the native-speaker community of that language.
+- Evaluate each category independently.
+- Return JSON only. Do not provide any explanation, preface, or extra text.
+
+When interpreting the comment, distinguish among:
+- endorsement or encouragement of harmful content,
+- neutral discussion or reporting,
+- condemnation or counterspeech,
+- quotation or reference,
+- satire, irony, or artistic expression,
+- educational, documentary, scientific, journalistic, or public-interest context.
+
+A text may contain multiple harms at once.
+Context may increase, decrease, or clarify harm, but do not rely on speculative background knowledge.
+
+# Toxicity Criteria
+
+## Toxicity
+A holistic view of the content. How toxic would you rate the content to be?
+Scale:
+1 = No toxicity
+2 = Slight toxicity
+3 = Toxic
+4 = Very toxic
+5 = Extreme toxicity
+
+## IdentityAttack
+Hateful or hurtful content targeting a group, or a person as a member of a group, ranging from stereotyping, denigration, and stigmatization to explicitly harmful discourse such as hate speech or slurs.
+Scale:
+1 = No presence of identity attacks
+2 = Content that could be construed as containing identity attacks in certain situations or contexts
+3 = Explicitly harmful content, including endorsement, promotion, or otherwise strong support of identity attacks
+
+## Bias
+Content containing or amplifying prejudice, stereotyping, or unfair evaluative claims toward or against a specific group, ideology, or person.
+Scale:
+1 = No presence of bias
+2 = Content that could be construed as containing bias in certain situations or contexts
+3 = Explicitly harmful content, including endorsement, promotion, or otherwise strong support of bias
+
+## Microaggression
+Subtle, indirect, or not explicitly harmful content targeting a specific group or a person as a member of a group, including patronizing, othering, or positive stereotyping.
+Scale:
+1 = No presence of microaggressions
+2 = Content that could be construed as containing microaggressions in certain situations or contexts
+3 = Content that clearly demonstrates microaggressions through patronizing, othering, or positive stereotyping patterns
+
+## Violence
+Content glorifying or promoting violence, threats, or self-harm.
+Scale:
+1 = No presence of violence
+2 = Content that could be construed as violent in certain situations or contexts
+3 = Explicitly harmful content, including endorsement, promotion, or otherwise strong support of violence
+
+## SelfHarm
+Content calling for physical or emotional actions intended to hurt, injure, or kill oneself.
+Scale:
+1 = No presence of self-harm
+2 = Content that could be construed as calling for self-harm in certain situations or contexts
+3 = Explicitly harmful content, including endorsement, promotion, or otherwise strong support of self-harm
+
+## Insult
+Insulting or otherwise negative content, including profanities.
+Scale:
+1 = No presence of insults
+2 = Content that could be construed as insulting in certain situations or contexts
+3 = Explicitly harmful content, including endorsement, promotion, or otherwise strong support of insults
+
+## SexualContent
+Referring to sexual acts and related content, both consensual and non-consensual.
+Scale:
+1 = No presence of sexual content
+2 = Content that could be construed as sexually explicit in certain situations or contexts
+3 = Explicitly harmful content, including endorsement, promotion, or otherwise strong support of sexual content
+
+# Output Format
+Return JSON only, using exactly these keys:
+{
+  "Toxicity": <1-5>,
+  "IdentityAttack": <1-3>,
+  "Bias": <1-3>,
+  "Microaggression": <1-3>,
+  "Violence": <1-3>,
+  "SelfHarm": <1-3>,
+  "Insult": <1-3>,
+  "SexualContent": <1-3>
+}
+
+Comment: {{COMMENT}}
+Response:
