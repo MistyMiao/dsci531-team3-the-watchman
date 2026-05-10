@@ -1,0 +1,775 @@
+---
+title: "study1_multilingual_multimodel_clean"
+format:
+  gfm:
+    preview-mode: raw
+    output-file: study1_multilingual_multimodel_clean.md
+    wrap: none
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+library(tidyverse)
+library(readr)
+library(irr)
+library(stringr)
+library(knitr)
+library(scales)
+library(patchwork)
+
+theme_set(theme_classic())
+```
+
+## Setup
+
+```{r}
+cats <- c(
+  "Toxicity", "IdentityAttack", "Bias", "Microaggression",
+  "Violence", "SelfHarm", "Insult", "SexualContent"
+)
+
+condition_levels <- c("control", "speech", "security")
+language_levels  <- c("cn", "en")
+model_levels     <- c("llama", "qwen")
+```
+
+## Prediction files: import and checks
+
+```{r}
+pred_files <- list.files(
+  path = ".",
+  pattern = "^classification_results_v[123]_(cn|en)_(llama|qwen)\\.csv$",
+  full.names = TRUE
+)
+
+if (length(pred_files) == 0) {
+  stop("No prediction files found. Check working directory and file names.")
+}
+
+file_info <- str_match(
+  basename(pred_files),
+  "^classification_results_(v[123])_(cn|en)_(llama|qwen)\\.csv$"
+)
+
+file_manifest <- tibble(
+  file = pred_files,
+  filename = basename(pred_files),
+  version = file_info[, 2],
+  language = file_info[, 3],
+  model = file_info[, 4]
+) %>%
+  mutate(
+    condition = recode(
+      version,
+      v1 = "control",
+      v2 = "speech",
+      v3 = "security"
+    ),
+    language = factor(language, levels = language_levels),
+    model = factor(model, levels = model_levels),
+    condition = factor(condition, levels = condition_levels)
+  ) %>%
+  arrange(language, model, condition)
+
+file_manifest
+```
+
+```{r}
+required_prediction_files <- expand_grid(
+  language = factor(language_levels, levels = language_levels),
+  model = factor(model_levels, levels = model_levels),
+  condition = factor(condition_levels, levels = condition_levels)
+)
+
+missing_prediction_files <- required_prediction_files %>%
+  anti_join(
+    file_manifest %>% select(language, model, condition),
+    by = c("language", "model", "condition")
+  )
+
+if (nrow(missing_prediction_files) > 0) {
+  print(missing_prediction_files)
+  stop("Some prediction files are missing.")
+}
+```
+
+```{r}
+required_cols <- c("id", "input_text", "raw_text", cats)
+
+file_manifest <- file_manifest %>%
+  mutate(
+    data = map(file, ~ read_csv(.x, show_col_types = FALSE)),
+    missing_cols = map(data, ~ setdiff(required_cols, names(.x)))
+  )
+
+bad_col_files <- file_manifest %>%
+  filter(map_int(missing_cols, length) > 0)
+
+if (nrow(bad_col_files) > 0) {
+  print(bad_col_files %>% select(filename, missing_cols))
+  stop("Some prediction files are missing required columns.")
+}
+```
+
+```{r}
+prediction_full <- file_manifest %>%
+  transmute(language, model, condition, filename, data) %>%
+  mutate(
+    data = map2(data, filename, ~ .x %>% mutate(source_file = .y))
+  ) %>%
+  unnest(data) %>%
+  mutate(
+    across(all_of(cats), as.numeric),
+    language = factor(language, levels = language_levels),
+    model = factor(model, levels = model_levels),
+    condition = factor(condition, levels = condition_levels)
+  )
+
+prediction_full
+```
+
+```{r}
+dup_check <- prediction_full %>%
+  count(language, model, condition, id) %>%
+  filter(n > 1)
+
+if (nrow(dup_check) > 0) {
+  print(dup_check)
+  stop("Duplicated ids detected within at least one language-model-condition cell.")
+}
+```
+
+```{r}
+coverage_check <- prediction_full %>%
+  distinct(language, model, condition, id) %>%
+  count(language, model, id, name = "n_conditions_present") %>%
+  filter(n_conditions_present != 3)
+
+if (nrow(coverage_check) > 0) {
+  print(coverage_check)
+  stop("Some ids do not appear in all three prompt conditions within a language-model cell.")
+}
+```
+
+```{r}
+n_check <- prediction_full %>%
+  distinct(language, model, condition, id) %>%
+  count(language, model, condition) %>%
+  pivot_wider(names_from = condition, values_from = n)
+
+n_check
+write_csv(n_check, "n_check_by_language_model_condition.csv")
+```
+
+```{r}
+score_qa_long <- prediction_full %>%
+  select(language, model, condition, id, all_of(cats)) %>%
+  pivot_longer(
+    cols = all_of(cats),
+    names_to = "category",
+    values_to = "score"
+  )
+
+missing_score_summary <- score_qa_long %>%
+  filter(is.na(score)) %>%
+  count(language, model, condition, category, name = "n_missing")
+
+illegal_score_summary <- score_qa_long %>%
+  filter(!is.na(score)) %>%
+  filter(
+    (category == "Toxicity" & !(score %in% 1:5)) |
+      (category != "Toxicity" & !(score %in% 1:3))
+  ) %>%
+  count(language, model, condition, category, name = "n_illegal")
+
+missing_score_summary
+illegal_score_summary
+
+if (nrow(illegal_score_summary) > 0) {
+  stop("Found illegal score values.")
+}
+
+write_csv(missing_score_summary, "missing_score_summary.csv")
+write_csv(illegal_score_summary, "illegal_score_summary.csv")
+```
+
+## Prediction-only analyses
+
+```{r}
+prediction_long <- prediction_full %>%
+  select(language, model, condition, id, input_text, all_of(cats)) %>%
+  pivot_longer(
+    cols = all_of(cats),
+    names_to = "category",
+    values_to = "score"
+  ) %>%
+  mutate(category = factor(category, levels = cats))
+```
+
+```{r}
+desc_stats <- prediction_long %>%
+  group_by(language, model, condition, category) %>%
+  summarise(
+    n = sum(!is.na(score)),
+    mean = mean(score, na.rm = TRUE),
+    sd = sd(score, na.rm = TRUE),
+    median = median(score, na.rm = TRUE),
+    min = min(score, na.rm = TRUE),
+    max = max(score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+desc_stats
+write_csv(desc_stats, "desc_stats_by_language_model_condition_category.csv")
+```
+
+```{r}
+wide_scores <- prediction_long %>%
+  select(language, model, id, category, condition, score) %>%
+  pivot_wider(
+    names_from = condition,
+    values_from = score
+  )
+```
+
+```{r}
+safe_paired_wilcox <- function(x, y) {
+  ok <- !is.na(x) & !is.na(y)
+  x <- x[ok]
+  y <- y[ok]
+
+  if (length(x) == 0) {
+    return(list(W = NA_real_, p = NA_real_))
+  }
+
+  if (all(x == y)) {
+    return(list(W = NA_real_, p = 1))
+  }
+
+  wt <- suppressWarnings(
+    wilcox.test(x, y, paired = TRUE, exact = FALSE)
+  )
+
+  list(W = unname(wt$statistic), p = wt$p.value)
+}
+```
+
+```{r}
+run_paired_wilcox <- function(wide_df, a, b) {
+  wide_df %>%
+    group_by(language, model, category) %>%
+    group_modify(~{
+      x <- .x[[a]]
+      y <- .x[[b]]
+      wt <- safe_paired_wilcox(x, y)
+
+      tibble(
+        n = sum(!is.na(x) & !is.na(y)),
+        mean_a = mean(x, na.rm = TRUE),
+        mean_b = mean(y, na.rm = TRUE),
+        mean_diff = mean(y - x, na.rm = TRUE),
+        median_diff = median(y - x, na.rm = TRUE),
+        changed = sum((y != x) & !is.na(x) & !is.na(y)),
+        up = sum((y > x) & !is.na(x) & !is.na(y)),
+        down = sum((y < x) & !is.na(x) & !is.na(y)),
+        W = wt$W,
+        p = wt$p
+      )
+    }) %>%
+    ungroup() %>%
+    mutate(comparison = paste0(b, "_vs_", a)) %>%
+    group_by(language, model, comparison) %>%
+    mutate(p_adj_bh = p.adjust(p, method = "BH")) %>%
+    ungroup() %>%
+    relocate(language, model, comparison, category)
+}
+```
+
+```{r}
+comp_speech_vs_control   <- run_paired_wilcox(wide_scores, "control", "speech")
+comp_security_vs_control <- run_paired_wilcox(wide_scores, "control", "security")
+comp_security_vs_speech  <- run_paired_wilcox(wide_scores, "speech", "security")
+
+pairwise_results <- bind_rows(
+  comp_speech_vs_control,
+  comp_security_vs_control,
+  comp_security_vs_speech
+)
+
+paper_table <- pairwise_results %>%
+  mutate(
+    mean_a = round(mean_a, 3),
+    mean_b = round(mean_b, 3),
+    mean_diff = round(mean_diff, 3),
+    median_diff = round(median_diff, 3),
+    p = signif(p, 3),
+    p_adj_bh = signif(p_adj_bh, 3)
+  ) %>%
+  select(
+    language, model, comparison, category, n,
+    mean_a, mean_b, mean_diff, median_diff,
+    changed, up, down, W, p, p_adj_bh
+  )
+
+paper_table
+write_csv(paper_table, "pairwise_wilcox_results_by_language_model.csv")
+```
+
+```{r}
+diff_summary <- pairwise_results %>%
+  transmute(language, model, category, comparison, mean_diff) %>%
+  mutate(
+    comparison = factor(
+      comparison,
+      levels = c("speech_vs_control", "security_vs_control", "security_vs_speech"),
+      labels = c("Speech - Control", "Security - Control", "Security - Speech")
+    ),
+    category = factor(category, levels = rev(cats))
+  )
+
+```
+
+```{r}
+make_diff_plot <- function(df, lang, mdl, panel_label, x_limits = NULL) {
+  p <- df %>%
+    filter(language == lang, model == mdl) %>%
+    ggplot(aes(x = mean_diff, y = category, fill = comparison)) +
+    geom_col(
+      position = position_dodge(width = 0.72),
+      width = 0.62
+    ) +
+    geom_vline(
+      xintercept = 0,
+      linewidth = 0.6,
+      linetype = "dashed"
+    ) +
+    scale_x_continuous(
+      labels = label_number(accuracy = 0.1),
+      expand = expansion(mult = c(0.02, 0.02))
+    ) +
+    labs(
+      x = "Mean difference in score",
+      y = NULL,
+      fill = NULL,
+      caption = panel_label
+    ) +
+    guides(fill = guide_legend(nrow = 1, byrow = TRUE)) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      legend.position = "top",
+      legend.direction = "horizontal",
+      legend.justification = "center",
+      legend.text = element_text(size = 9),
+      axis.title.x = element_text(size = 12),
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.caption = element_text(
+        hjust = 0.5,
+        family = "serif",
+        face = "bold",
+        size = 13,
+        margin = margin(t = 10)
+      ),
+      plot.caption.position = "plot",
+      plot.margin = margin(8, 8, 8, 8)
+    )
+
+  if (!is.null(x_limits)) {
+    p <- p + coord_cartesian(xlim = x_limits)
+  }
+
+  p
+}
+
+# 如果你想更像示例图，可以给 Llama 和 Qwen 用不同的 x 轴范围
+x_llama <- c(-0.15, 0.35)
+x_qwen  <- c(-0.15, 0.22)
+
+main_diff_plot_cn_llama <- make_diff_plot(
+  diff_summary, "cn", "llama",
+  "(a) Chinese, Llama",
+  x_limits = x_llama
+)
+
+main_diff_plot_cn_qwen <- make_diff_plot(
+  diff_summary, "cn", "qwen",
+  "(b) Chinese, Qwen",
+  x_limits = x_qwen
+)
+
+main_diff_plot_en_llama <- make_diff_plot(
+  diff_summary, "en", "llama",
+  "(c) English, Llama",
+  x_limits = x_llama
+)
+
+main_diff_plot_en_qwen <- make_diff_plot(
+  diff_summary, "en", "qwen",
+  "(d) English, Qwen",
+  x_limits = x_qwen
+)
+
+main_diff_plot_combined <-
+  (main_diff_plot_cn_llama | main_diff_plot_cn_qwen) /
+  (main_diff_plot_en_llama | main_diff_plot_en_qwen) +
+  plot_annotation(
+    theme = theme(
+      plot.caption = element_text(
+        hjust = 0,
+        family = "serif",
+        size = 14,
+        face = "bold",
+        margin = margin(t = 12)
+      )
+    )
+  )
+
+main_diff_plot_combined
+
+ggsave(
+  filename = "main_mean_difference_barplot_combined.png",
+  plot = main_diff_plot_combined,
+  width = 14,
+  height = 10.5,
+  dpi = 600,
+  bg = "white"
+)
+```
+
+
+## Gold files and matched subset
+
+```{r}
+gold_candidates <- tribble(
+  ~language, ~candidate,
+  "cn", "RTP_LX_ZH_Hans_prompt_gold.csv",
+  "cn", "RTP_LX_ZH_Hans_gold.csv",
+  "cn", "RTP_LX_ZH_prompt_gold.csv",
+  "en", "RTP_LX_EN_prompt_gold.csv",
+  "en", "RTP_LX_English_prompt_gold.csv",
+  "en", "RTP_LX_EN_gold.csv"
+)
+
+gold_manifest <- gold_candidates %>%
+  mutate(exists = file.exists(candidate)) %>%
+  group_by(language) %>%
+  filter(exists) %>%
+  slice(1) %>%
+  ungroup() %>%
+  rename(file = candidate)
+
+missing_gold_lang <- tibble(language = language_levels) %>%
+  anti_join(gold_manifest %>% select(language), by = "language")
+
+if (nrow(missing_gold_lang) > 0) {
+  print(missing_gold_lang)
+  stop("Gold file missing for at least one language.")
+}
+```
+
+```{r}
+standardize_gold <- function(df) {
+  if ("gold_input_text" %in% names(df)) {
+    df <- df %>% rename(input_text = gold_input_text)
+  }
+
+  if ("gold_id" %in% names(df) && !"id" %in% names(df)) {
+    df <- df %>% rename(id = gold_id)
+  }
+
+  for (nm in cats) {
+    if (nm %in% names(df) && !paste0("gold_", nm) %in% names(df)) {
+      df <- df %>% rename(!!paste0("gold_", nm) := all_of(nm))
+    }
+  }
+
+  df
+}
+```
+
+```{r}
+gold_all <- gold_manifest %>%
+  mutate(
+    data = map2(
+      file, language,
+      ~ read_csv(.x, show_col_types = FALSE) %>%
+        standardize_gold() %>%
+        mutate(language = .y)
+    )
+  ) %>%
+  select(data) %>%
+  unnest(data)
+
+gold_all
+```
+
+```{r}
+gold_long_ref <- gold_all %>%
+  pivot_longer(
+    cols = all_of(paste0("gold_", cats)),
+    names_to = "gold_category",
+    values_to = "gold_score"
+  ) %>%
+  mutate(category = str_remove(gold_category, "^gold_")) %>%
+  select(language, id, input_text, category, gold_score)
+```
+
+```{r}
+gold_joined <- prediction_full %>%
+  pivot_longer(
+    cols = all_of(cats),
+    names_to = "category",
+    values_to = "pred_score"
+  ) %>%
+  left_join(
+    gold_long_ref,
+    by = c("language", "id", "category"),
+    suffix = c("_pred", "_gold")
+  ) %>%
+  rename(
+    pred_input_text = input_text_pred,
+    gold_input_text = input_text_gold
+  ) %>%
+  mutate(
+    category = factor(category, levels = cats),
+    error = pred_score - gold_score,
+    abs_error = abs(error),
+    exact_match = pred_score == gold_score
+  )
+```
+
+```{r}
+merge_summary <- gold_joined %>%
+  summarise(
+    total = n(),
+    missing_gold = sum(is.na(gold_score)),
+    matched_prop = mean(!is.na(gold_score))
+  )
+
+merge_summary
+```
+
+```{r}
+unmatched_panel_summary <- gold_joined %>%
+  filter(is.na(gold_score)) %>%
+  distinct(language, model, condition, id) %>%
+  count(language, model, condition, name = "n_unmatched_items")
+
+unmatched_panel_summary
+write_csv(unmatched_panel_summary, "unmatched_panel_summary.csv")
+```
+
+```{r}
+gold_matched <- gold_joined %>%
+  filter(!is.na(gold_score))
+```
+
+```{r}
+common_ids_by_language <- gold_matched %>%
+  distinct(language, model, id) %>%
+  count(language, id) %>%
+  filter(n == 2)
+
+gold_matched_common <- gold_matched %>%
+  semi_join(common_ids_by_language, by = c("language", "id"))
+```
+
+## Gold-based agreement analyses
+
+```{r}
+human_alignment_summary <- gold_matched %>%
+  group_by(language, model, condition, category) %>%
+  summarise(
+    n = n(),
+    pred_mean = mean(pred_score),
+    gold_mean = mean(gold_score),
+    signed_error = mean(error),
+    mae = mean(abs_error),
+    exact_match_prop = mean(exact_match),
+    over_rate_prop = mean(error > 0),
+    under_rate_prop = mean(error < 0),
+    .groups = "drop"
+  )
+
+human_alignment_summary
+write_csv(human_alignment_summary, "human_alignment_summary_by_language_model.csv")
+```
+
+```{r}
+calc_kappa <- function(df) {
+  tmp <- df %>%
+    select(pred_score, gold_score) %>%
+    drop_na()
+
+  if (nrow(tmp) < 2) return(NA_real_)
+
+  irr::kappa2(tmp, weight = "squared")$value
+}
+
+kappa_results <- gold_matched %>%
+  group_by(language, model, condition, category) %>%
+  group_modify(~ tibble(weighted_kappa = calc_kappa(.x))) %>%
+  ungroup()
+
+kappa_results
+write_csv(kappa_results, "weighted_kappa_results_by_language_model.csv")
+```
+
+```{r}
+alignment_table <- human_alignment_summary %>%
+  left_join(
+    kappa_results,
+    by = c("language", "model", "condition", "category")
+  ) %>%
+  mutate(
+    pred_mean = round(pred_mean, 3),
+    gold_mean = round(gold_mean, 3),
+    signed_error = round(signed_error, 3),
+    mae = round(mae, 3),
+    exact_match_prop = round(exact_match_prop, 3),
+    over_rate_prop = round(over_rate_prop, 3),
+    under_rate_prop = round(under_rate_prop, 3),
+    weighted_kappa = round(weighted_kappa, 3)
+  )
+
+alignment_table
+write_csv(alignment_table, "alignment_table_for_paper_by_language_model.csv")
+```
+
+```{r}
+tox_gold <- gold_matched %>%
+  filter(category == "Toxicity") %>%
+  mutate(
+    gold_remove = if_else(gold_score >= 4, 1, 0),
+    pred_remove = if_else(pred_score >= 4, 1, 0)
+  )
+
+remove_error_summary <- tox_gold %>%
+  group_by(language, model, condition) %>%
+  summarise(
+    TP = sum(pred_remove == 1 & gold_remove == 1),
+    TN = sum(pred_remove == 0 & gold_remove == 0),
+    FP = sum(pred_remove == 1 & gold_remove == 0),
+    FN = sum(pred_remove == 0 & gold_remove == 1),
+    FPR = FP / (FP + TN),
+    FNR = FN / (FN + TP),
+    accuracy = (TP + TN) / n(),
+    .groups = "drop"
+  )
+
+remove_error_summary
+write_csv(remove_error_summary, "remove_error_summary_vs_gold_by_language_model.csv")
+```
+
+## Cross-model comparison
+
+### Prediction-only cross-model comparison
+
+```{r}
+wide_model_scores <- prediction_long %>%
+  select(language, condition, id, category, model, score) %>%
+  pivot_wider(
+    names_from = model,
+    values_from = score
+  )
+```
+
+```{r}
+run_model_wilcox <- function(wide_df, a = "llama", b = "qwen") {
+  wide_df %>%
+    group_by(language, condition, category) %>%
+    group_modify(~{
+      x <- .x[[a]]
+      y <- .x[[b]]
+      wt <- safe_paired_wilcox(x, y)
+
+      tibble(
+        n = sum(!is.na(x) & !is.na(y)),
+        mean_a = mean(x, na.rm = TRUE),
+        mean_b = mean(y, na.rm = TRUE),
+        mean_diff = mean(y - x, na.rm = TRUE),
+        median_diff = median(y - x, na.rm = TRUE),
+        W = wt$W,
+        p = wt$p
+      )
+    }) %>%
+    ungroup() %>%
+    group_by(language, condition) %>%
+    mutate(p_adj_bh = p.adjust(p, method = "BH")) %>%
+    ungroup() %>%
+    mutate(comparison = "qwen_vs_llama") %>%
+    relocate(language, condition, comparison, category)
+}
+
+model_comparison_results <- run_model_wilcox(wide_model_scores)
+
+model_comparison_results
+write_csv(model_comparison_results, "model_comparison_results_prediction_only.csv")
+```
+
+### Gold-based common-subset cross-model comparison
+
+```{r}
+wide_model_error <- gold_matched_common %>%
+  select(language, condition, id, category, model, error, abs_error) %>%
+  pivot_wider(
+    names_from = model,
+    values_from = c(error, abs_error)
+  )
+```
+
+```{r}
+run_model_metric_wilcox <- function(df, prefix) {
+  df %>%
+    group_by(language, condition, category) %>%
+    group_modify(~{
+      x <- .x[[paste0(prefix, "_llama")]]
+      y <- .x[[paste0(prefix, "_qwen")]]
+      wt <- safe_paired_wilcox(x, y)
+
+      tibble(
+        n = sum(!is.na(x) & !is.na(y)),
+        mean_llama = mean(x, na.rm = TRUE),
+        mean_qwen = mean(y, na.rm = TRUE),
+        mean_diff = mean(y - x, na.rm = TRUE),
+        median_diff = median(y - x, na.rm = TRUE),
+        W = wt$W,
+        p = wt$p
+      )
+    }) %>%
+    ungroup() %>%
+    group_by(language, condition) %>%
+    mutate(p_adj_bh = p.adjust(p, method = "BH")) %>%
+    ungroup() %>%
+    mutate(metric = prefix) %>%
+    relocate(language, condition, metric, category)
+}
+
+model_error_comparison <- bind_rows(
+  run_model_metric_wilcox(wide_model_error, "error"),
+  run_model_metric_wilcox(wide_model_error, "abs_error")
+)
+
+model_error_comparison
+write_csv(model_error_comparison, "model_error_comparison_common_gold_subset.csv")
+```
+
+## Appendix: compact diagnostics
+
+```{r}
+diagnostic_summary <- list(
+  file_manifest = file_manifest,
+  n_check = n_check,
+  missing_score_summary = missing_score_summary,
+  merge_summary = merge_summary,
+  unmatched_panel_summary = unmatched_panel_summary
+)
+
+diagnostic_summary
+```
